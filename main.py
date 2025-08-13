@@ -26,7 +26,7 @@ logger = logging.getLogger(__name__)
 
 # ====== Environment variables ======
 TOKEN = os.getenv("TELEGRAM_TOKEN")                    # Telegram bot token
-VK_TOKEN = os.getenv("VK_TOKEN")                       # VK user token with groups permission
+VK_TOKEN = os.getenv("VK_SERVICE_TOKEN") or os.getenv("VK_TOKEN")                      # VK user token with groups permission
 VK_GROUP_ID = int(os.getenv("VK_GROUP_ID", "0"))       # VK public group ID (integer)
 VK_CONFIRMATION = os.getenv("VK_CONFIRMATION")         # <-- paste the confirmation string from VK Callback settings (e.g. 576c75ac)
 VK_SECRET = os.getenv("VK_SECRET", "")                 # optional: set the same 'Secret key' as in VK settings
