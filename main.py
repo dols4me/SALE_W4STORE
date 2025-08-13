@@ -2,9 +2,8 @@
 # -*- coding: utf-8 -*-
 """
 Telegram bot (aiogram v3) + VK Callback (aiohttp)
-— Проверка: состоит ли пользователь в сообществе VK
-— Если возможно, показывает, сколько дней пользователь подписан (по member_since)
-— Без даты рождения, только VK ID
+— Проверка членства в сообществе VK
+— Показывает, сколько дней подписан (через member_since), используя VK Script (execute) для быстрого поиска
 """
 
 import os
@@ -25,17 +24,20 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # ====== ENV ======
-TOKEN = os.getenv("TELEGRAM_TOKEN")  # Telegram bot token
+TOKEN = os.getenv("TELEGRAM_TOKEN")
 
-# выбираем VK-токен по приоритету: токен сообщества -> сервисный -> пользовательский
+# приоритет токенов VK: токен сообщества -> сервисный -> пользовательский
 VK_TOKEN_COMMUNITY = os.getenv("VK_COMMUNITY_TOKEN")
 VK_TOKEN_SERVICE   = os.getenv("VK_SERVICE_TOKEN")
 VK_TOKEN_USER      = os.getenv("VK_TOKEN")
 VK_TOKEN = VK_TOKEN_COMMUNITY or VK_TOKEN_SERVICE or VK_TOKEN_USER
 
-VK_GROUP_ID = int(os.getenv("VK_GROUP_ID", "0"))                # ID сообщества (положительное число)
-VK_CONFIRMATION = os.getenv("VK_CONFIRMATION")                  # строка подтверждения для Callback
-VK_SECRET = os.getenv("VK_SECRET", "")                          # секрет для Callback (желательно задать)
+VK_GROUP_ID = int(os.getenv("VK_GROUP_ID", "0"))         # положительный ID сообщества
+VK_CONFIRMATION = os.getenv("VK_CONFIRMATION")           # строка подтверждения callback
+VK_SECRET = os.getenv("VK_SECRET", "")                   # секрет callback (необязателен, но желательно)
+
+# сколько максимум пользователей просматривать в поиске member_since (шагами по 25k через execute)
+VK_MAX_SCAN = int(os.getenv("VK_MAX_SCAN", "200000"))
 
 if not all([TOKEN, VK_TOKEN, VK_GROUP_ID]):
     raise SystemExit("Укажите TELEGRAM_TOKEN, VK_(COMMUNITY|SERVICE|)TOKEN и VK_GROUP_ID в переменных окружения.")
@@ -46,7 +48,7 @@ if not VK_CONFIRMATION:
 bot = Bot(token=TOKEN)
 dp = Dispatcher()
 
-# Храним только vk_id пользователя
+# только vk_id у пользователя
 user_data = {}
 
 # ====== FSM ======
@@ -62,7 +64,7 @@ def main_menu():
     ]
     return ReplyKeyboardMarkup(keyboard=kb, resize_keyboard=True)
 
-# ====== VK: резолв коротких имён в числовой user_id ======
+# ====== VK: резолв коротких имён ======
 async def resolve_user_id(identifier: str) -> int | None:
     ident = identifier.strip()
     if ident.isdigit():
@@ -89,10 +91,9 @@ async def resolve_user_id(identifier: str) -> int | None:
 
 # ====== VK: проверка членства ======
 async def vk_is_member(vk_id: int) -> bool | None:
-    """True/False — членство; None — ошибка VK API"""
     url = "https://api.vk.com/method/groups.isMember"
     params = {
-        "group_id": VK_GROUP_ID,   # положительный ID, без минуса/club
+        "group_id": VK_GROUP_ID,
         "user_id": vk_id,
         "v": "5.199",
         "access_token": VK_TOKEN
@@ -105,64 +106,78 @@ async def vk_is_member(vk_id: int) -> bool | None:
             logger.error(f"VK API groups.isMember error: {data}")
             return None
 
-# ====== VK: попытка получить member_since (с пагинацией) ======
-async def vk_get_member_since_days(vk_id: int, max_scan: int = 5000, page_size: int = 1000) -> int | None:
+# ====== VK: быстрый поиск member_since через execute (25k за вызов) ======
+async def vk_get_member_since_days_execute(vk_id: int, step: int = 25000, hard_limit: int | None = None) -> int | None:
     """
-    Пытается найти пользователя в списке участников, запрашивая страницы
-    groups.getMembers с fields=member_since. Возвращает количество дней
-    с момента вступления или None, если не нашли/нет доступа.
-    max_scan — максимум пользователей, которых просмотрим (ради производительности).
+    Ищем пользователя в списке участников с fields=member_since пакетами по 25k через VK Script.
+    Возвращаем количество дней с момента вступления или None, если не нашли/нет доступа.
     """
-    url = "https://api.vk.com/method/groups.getMembers"
-    scanned = 0
+    if hard_limit is None:
+        hard_limit = max(step, VK_MAX_SCAN)
+
+    # VK Script: 25 вызовов groups.getMembers по 1000, начиная с offset
+    script = """
+    var gid = %d;
+    var uid = %d;
+    var offset = %d;
+    var i = 0;
+    var count = 1000;
+    var found = 0;
+    var ms = 0;
+    while (i < 25) {
+        var resp = API.groups.getMembers({
+            "group_id": gid,
+            "offset": offset + i * count,
+            "count": count,
+            "fields": "member_since"
+        });
+        var items = resp.items;
+        if (items.length == 0) { break; }
+        var j = 0;
+        while (j < items.length) {
+            if (items[j].id == uid) {
+                found = 1;
+                ms = items[j].member_since;
+                break;
+            }
+            j = j + 1;
+        }
+        if (found == 1) { break; }
+        i = i + 1;
+    }
+    return {"found": found, "member_since": ms, "next_offset": offset + i * count + (found == 1 ? 0 : count * (i > 0 ? 1 : 1))};
+    """
+
     offset = 0
-
-    # защита от невалидных параметров
-    page_size = max(1, min(page_size, 1000))
-    max_scan = max(page_size, max_scan)
-
     async with aiohttp.ClientSession() as session:
-        while scanned < max_scan:
+        while offset < hard_limit:
+            code = script % (VK_GROUP_ID, vk_id, offset)
             params = {
-                "group_id": VK_GROUP_ID,
-                "offset": offset,
-                "count": page_size,
-                "fields": "member_since",
+                "code": code,
                 "v": "5.199",
                 "access_token": VK_TOKEN
             }
-            async with session.get(url, params=params) as resp:
+            async with session.post("https://api.vk.com/method/execute", data=params) as resp:
                 data = await resp.json()
+
             if "error" in data:
-                logger.error(f"VK API groups.getMembers error: {data}")
+                logger.error(f"VK API execute error: {data}")
                 return None
-            resp_obj = data.get("response") or {}
-            items = resp_obj.get("items") or []
-            if not items:
-                # конец списка
-                break
 
-            for u in items:
-                try:
-                    if int(u.get("id")) == int(vk_id):
-                        member_since = u.get("member_since")
-                        if member_since:
-                            try:
-                                dt = datetime.fromtimestamp(int(member_since), tz=timezone.utc)
-                                days = (datetime.now(tz=timezone.utc) - dt).days
-                                return max(0, days)
-                            except Exception:
-                                return None
-                        else:
-                            return None
-                except Exception:
-                    continue
+            result = data.get("response") or {}
+            if result.get("found") == 1:
+                ms = result.get("member_since")
+                if ms:
+                    try:
+                        dt = datetime.fromtimestamp(int(ms), tz=timezone.utc)
+                        days = (datetime.now(tz=timezone.utc) - dt).days
+                        return max(0, days)
+                    except Exception:
+                        return None
+                return None
 
-            scanned += len(items)
-            offset += len(items)
-
-            if scanned >= max_scan:
-                break
+            # двигаем окно на следующий блок 25k
+            offset += step
 
     return None
 
@@ -176,7 +191,7 @@ async def about_bot(message: types.Message):
     await message.answer(
         "Это бот программы лояльности.\n"
         "• «Ваша карта» — проверяет, подписаны ли вы на паблик VK и, если возможно, показывает, сколько дней вы с нами.\n"
-        "• «Настройки» — для ввода вашего VK ID (цифры, id123 или короткое имя)."
+        "• «Настройки» — введите ваш VK ID (цифры, id123 или короткое имя)."
     )
 
 @dp.message(F.text == "Ваша карта")
@@ -185,19 +200,19 @@ async def your_card(message: types.Message):
     if user_id not in user_data or "vk_id" not in user_data[user_id]:
         await message.answer("Сначала укажите ваш VK ID в «Настройки».")
         return
+
     vk_id = user_data[user_id]["vk_id"]
 
     is_member = await vk_is_member(vk_id)
     if is_member is None:
-        await message.answer("Не удалось проверить подписку. Проверьте VK токен/доступы в Railway.")
+        await message.answer("Не удалось проверить подписку. Проверьте токен VK и права доступа.")
         return
 
     if not is_member:
         await message.answer("Вы ещё не с нами ❌")
         return
 
-    # состоит — пытаемся узнать 'сколько дней'
-    days = await vk_get_member_since_days(vk_id)
+    days = await vk_get_member_since_days_execute(vk_id)
     if isinstance(days, int):
         await message.answer(f"Вы с нами! ✅\nПодписаны уже {days} дн.")
     else:
@@ -231,7 +246,6 @@ async def handle_vk_callback(request: web.Request) -> web.Response:
     evt_type = payload.get("type", "")
     secret = payload.get("secret", "")
 
-    # Проверка секрета (если задан)
     if VK_SECRET and secret != VK_SECRET:
         logger.warning("VK secret mismatch")
         return web.Response(text="ok")
@@ -240,10 +254,8 @@ async def handle_vk_callback(request: web.Request) -> web.Response:
         if not VK_CONFIRMATION:
             logger.error("VK_CONFIRMATION is missing; cannot confirm VK server.")
             return web.Response(text="")
-        # вернуть ровно строку подтверждения
         return web.Response(text=VK_CONFIRMATION)
 
-    # прочие события подтверждаем
     return web.Response(text="ok")
 
 async def healthcheck(request: web.Request) -> web.Response:
@@ -267,10 +279,9 @@ async def main():
     await site.start()
     logger.info(f"VK Callback server listening on 0.0.0.0:{port}")
 
-    # Telegram: стираем вебхук, чтобы polling не конфликтовал
+    # Telegram: удаляем вебхук, чтобы polling не конфликтовал
     await bot.delete_webhook(drop_pending_updates=True)
 
-    # Telegram polling
     try:
         await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
     finally:
