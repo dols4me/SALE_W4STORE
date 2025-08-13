@@ -110,48 +110,62 @@ async def vk_is_member(vk_id: int) -> bool | None:
 async def vk_get_member_since_days_execute(vk_id: int, step: int = 25000, hard_limit: int | None = None) -> int | None:
     """
     Ищем пользователя в списке участников с fields=member_since пакетами по 25k через VK Script.
-    Возвращаем количество дней с момента вступления или None, если не нашли/нет доступа.
+    Без break/continue: выходим из циклов через флаги.
+    Возвращаем количество дней или None, если не нашли/нет доступа.
     """
-    if hard_limit is None:
-        hard_limit = max(step, VK_MAX_SCAN)
+    from datetime import datetime, timezone
 
-    # VK Script: 25 вызовов groups.getMembers по 1000, начиная с offset
-    script = """
-    var gid = %d;
-    var uid = %d;
-    var offset = %d;
+    if hard_limit is None:
+        hard_limit = max(step, int(os.getenv("VK_MAX_SCAN", "200000")))
+
+    # VK Script (без break):
+    # - 25 итераций по 1000 (offset + i*1000)
+    # - флаги found/stop вместо break
+    script_tmpl = """
+    var gid = {gid};
+    var uid = {uid};
+    var base = {base};
     var i = 0;
     var count = 1000;
     var found = 0;
     var ms = 0;
-    while (i < 25) {
-        var resp = API.groups.getMembers({
+    var stop = 0;
+
+    while (i < 25 && stop == 0 && found == 0) {{
+        var resp = API.groups.getMembers({{
             "group_id": gid,
-            "offset": offset + i * count,
+            "offset": base + i * count,
             "count": count,
             "fields": "member_since"
-        });
+        }});
         var items = resp.items;
-        if (items.length == 0) { break; }
+        var len = items.length;
         var j = 0;
-        while (j < items.length) {
-            if (items[j].id == uid) {
+        while (j < len && found == 0) {{
+            if (items[j].id == uid) {{
                 found = 1;
                 ms = items[j].member_since;
-                break;
-            }
+            }} else {{
+                // no-op
+            }}
             j = j + 1;
-        }
-        if (found == 1) { break; }
+        }}
+        // если страница короче 1000 — дошли до конца списка
+        if (len < count) {{
+            stop = 1;
+        }}
         i = i + 1;
-    }
-    return {"found": found, "member_since": ms, "next_offset": offset + i * count + (found == 1 ? 0 : count * (i > 0 ? 1 : 1))};
+    }}
+
+    // следующий базовый оффсет для следующего вызова (если понадобится)
+    var next_off = base + (25 * count);
+    return {{"found": found, "member_since": ms, "next_offset": next_off, "stopped": stop}};
     """
 
     offset = 0
     async with aiohttp.ClientSession() as session:
         while offset < hard_limit:
-            code = script % (VK_GROUP_ID, vk_id, offset)
+            code = script_tmpl.format(gid=VK_GROUP_ID, uid=vk_id, base=offset)
             params = {
                 "code": code,
                 "v": "5.199",
@@ -164,20 +178,23 @@ async def vk_get_member_since_days_execute(vk_id: int, step: int = 25000, hard_l
                 logger.error(f"VK API execute error: {data}")
                 return None
 
-            result = data.get("response") or {}
-            if result.get("found") == 1:
-                ms = result.get("member_since")
+            res = data.get("response") or {}
+            if res.get("found") == 1:
+                ms = res.get("member_since")
                 if ms:
                     try:
                         dt = datetime.fromtimestamp(int(ms), tz=timezone.utc)
-                        days = (datetime.now(tz=timezone.utc) - dt).days
-                        return max(0, days)
+                        return max(0, (datetime.now(tz=timezone.utc) - dt).days)
                     except Exception:
                         return None
                 return None
 
-            # двигаем окно на следующий блок 25k
-            offset += step
+            # если скрипт сообщил, что дошли до конца — дальше искать смысла нет
+            if res.get("stopped") == 1:
+                return None
+
+            # иначе двигаем окно на следующий блок 25k записей
+            offset = int(res.get("next_offset") or (offset + step))
 
     return None
 
