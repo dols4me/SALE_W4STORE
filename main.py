@@ -107,95 +107,159 @@ async def vk_is_member(vk_id: int) -> bool | None:
             return None
 
 # ====== VK: быстрый поиск member_since через execute (25k за вызов) ======
-async def vk_get_member_since_days_execute(vk_id: int, step: int = 25000, hard_limit: int | None = None) -> int | None:
+async def vk_get_member_since_days_execute(vk_id: int) -> int | None:
     """
-    Ищем пользователя в списке участников с fields=member_since пакетами по 25k через VK Script.
-    Без break/continue: выходим из циклов через флаги.
-    Возвращаем количество дней или None, если не нашли/нет доступа.
+    Ищем member_since через VK Script (execute) блоками.
+    Адаптивно уменьшаем размер блока при error_code=13 (Too many operations).
+    Возвращает количество дней или None.
     """
     from datetime import datetime, timezone
 
-    if hard_limit is None:
-        hard_limit = max(step, int(os.getenv("VK_MAX_SCAN", "200000")))
-
-    # VK Script (без break):
-    # - 25 итераций по 1000 (offset + i*1000)
-    # - флаги found/stop вместо break
-    script_tmpl = """
-    var gid = {gid};
-    var uid = {uid};
-    var base = {base};
-    var i = 0;
-    var count = 1000;
-    var found = 0;
-    var ms = 0;
-    var stop = 0;
-
-    while (i < 25 && stop == 0 && found == 0) {{
-        var resp = API.groups.getMembers({{
-            "group_id": gid,
-            "offset": base + i * count,
-            "count": count,
-            "fields": "member_since"
-        }});
-        var items = resp.items;
-        var len = items.length;
-        var j = 0;
-        while (j < len && found == 0) {{
-            if (items[j].id == uid) {{
-                found = 1;
-                ms = items[j].member_since;
-            }} else {{
-                // no-op
-            }}
-            j = j + 1;
-        }}
-        // если страница короче 1000 — дошли до конца списка
-        if (len < count) {{
-            stop = 1;
-        }}
-        i = i + 1;
-    }}
-
-    // следующий базовый оффсет для следующего вызова (если понадобится)
-    var next_off = base + (25 * count);
-    return {{"found": found, "member_since": ms, "next_offset": next_off, "stopped": stop}};
-    """
-
+    # настройки сканирования
+    hard_limit = int(os.getenv("VK_MAX_SCAN", "200000"))   # максимум просмотренных участников
+    # возможные размеры блока за один execute (кол-во элементов = BATCH_CALLS * 1000)
+    BATCH_CALLS_CHOICES = [10, 5, 2, 1]  # 10k → 5k → 2k → 1k
     offset = 0
+
     async with aiohttp.ClientSession() as session:
         while offset < hard_limit:
-            code = script_tmpl.format(gid=VK_GROUP_ID, uid=vk_id, base=offset)
-            params = {
-                "code": code,
-                "v": "5.199",
-                "access_token": VK_TOKEN
-            }
-            async with session.post("https://api.vk.com/method/execute", data=params) as resp:
-                data = await resp.json()
+            # пробуем от большого блока к меньшему
+            found_in_this_window = False
+            for calls in BATCH_CALLS_CHOICES:
+                # VK Script без break/continue
+                script = f"""
+                var gid = {VK_GROUP_ID};
+                var uid = {vk_id};
+                var base = {offset};
+                var count = 1000;
+                var loops = {calls}; // сколько страниц по 1000 за раз
+                var i = 0;
+                var found = 0;
+                var ms = 0;
+                var stop = 0;
 
-            if "error" in data:
-                logger.error(f"VK API execute error: {data}")
-                return None
+                while (i < loops && stop == 0 && found == 0) {{
+                    var resp = API.groups.getMembers({{
+                        "group_id": gid,
+                        "offset": base + i * count,
+                        "count": count,
+                        "fields": "member_since"
+                    }});
+                    var items = resp.items;
+                    var len = items.length;
+                    var j = 0;
+                    while (j < len && found == 0) {{
+                        if (items[j].id == uid) {{
+                            found = 1;
+                            ms = items[j].member_since;
+                        }}
+                        j = j + 1;
+                    }}
+                    if (len < count) {{ stop = 1; }}
+                    i = i + 1;
+                }}
 
-            res = data.get("response") or {}
-            if res.get("found") == 1:
-                ms = res.get("member_since")
-                if ms:
-                    try:
-                        dt = datetime.fromtimestamp(int(ms), tz=timezone.utc)
-                        return max(0, (datetime.now(tz=timezone.utc) - dt).days)
-                    except Exception:
+                return {{"found": found, "member_since": ms, "stop": stop}};
+                """
+
+                params = {
+                    "code": script,
+                    "v": "5.199",
+                    "access_token": VK_TOKEN
+                }
+
+                async with session.post("https://api.vk.com/method/execute", data=params) as resp:
+                    data = await resp.json()
+
+                # обработка ошибок
+                if "error" in data:
+                    err = data["error"]
+                    code = err.get("error_code")
+                    # 13 — слишком много операций: пробуем меньший блок
+                    if code == 13:
+                        logger.warning(f"VK execute: Too many operations on calls={calls}, shrinking batch…")
+                        await asyncio.sleep(0.2)  # крошечный бэкофф
+                        continue
+                    else:
+                        logger.error(f"VK API execute error: {data}")
                         return None
-                return None
 
-            # если скрипт сообщил, что дошли до конца — дальше искать смысла нет
-            if res.get("stopped") == 1:
-                return None
+                res = data.get("response") or {}
+                if res.get("found") == 1:
+                    ms = res.get("member_since")
+                    if ms:
+                        try:
+                            dt = datetime.fromtimestamp(int(ms), tz=timezone.utc)
+                            return max(0, (datetime.now(tz=timezone.utc) - dt).days)
+                        except Exception:
+                            return None
+                    return None
 
-            # иначе двигаем окно на следующий блок 25k записей
-            offset = int(res.get("next_offset") or (offset + step))
+                # если дошли до конца списка — дальше не ищем
+                if res.get("stop") == 1:
+                    return None
 
+                # если не нашли и не «стоп», но ошибок нет — значит этот блок успешно просмотрен
+                found_in_this_window = True
+                # сдвигаем offset на calls*1000 и переходим к следующему окну
+                offset += calls * 1000
+                break  # выходим из цикла по BATCH_CALLS_CHOICES (успешный просмотр)
+
+            # если ни один размер блока не отработал (все падали на 13) — попробуем ручной микрошаг
+            if not found_in_this_window:
+                # последний шанс: 1 страница в отдельном execute
+                script_single = f"""
+                var resp = API.groups.getMembers({{
+                    "group_id": {VK_GROUP_ID},
+                    "offset": {offset},
+                    "count": 1000,
+                    "fields": "member_since"
+                }});
+                var items = resp.items;
+                var len = items.length;
+                var j = 0;
+                var found = 0;
+                var ms = 0;
+                while (j < len && found == 0) {{
+                    if (items[j].id == {vk_id}) {{
+                        found = 1;
+                        ms = items[j].member_since;
+                    }}
+                    j = j + 1;
+                }}
+                var stop = 0;
+                if (len < 1000) {{ stop = 1; }}
+                return {{"found": found, "member_since": ms, "stop": stop}};
+                """
+                params_single = {
+                    "code": script_single,
+                    "v": "5.199",
+                    "access_token": VK_TOKEN
+                }
+                async with session.post("https://api.vk.com/method/execute", data=params_single) as resp:
+                    data_single = await resp.json()
+
+                if "error" in data_single:
+                    logger.error(f"VK API execute error (single): {data_single}")
+                    return None
+
+                res = data_single.get("response") or {}
+                if res.get("found") == 1:
+                    ms = res.get("member_since")
+                    if ms:
+                        try:
+                            dt = datetime.fromtimestamp(int(ms), tz=timezone.utc)
+                            return max(0, (datetime.now(tz=timezone.utc) - dt).days)
+                        except Exception:
+                            return None
+                    return None
+
+                if res.get("stop") == 1:
+                    return None
+
+                # двигаемся дальше по 1000
+                offset += 1000
+                await asyncio.sleep(0.15)  # слегка разгружаем
     return None
 
 # ====== Telegram handlers ======
