@@ -3,8 +3,8 @@
 """
 Telegram bot (aiogram v3) + VK Callback (aiohttp)
 — Проверка членства в сообществе VK
-— Показ дней подписки (если доступно member_since) без execute — через пагинацию groups.getMembers
-— Ввод VK ID: поддерживаются числа, префикс id123 и короткое имя (screen name)
+— Дни подписки через БЫСТРЫЙ бинарный поиск по groups.getMembers (sort=id_asc), без execute и без полного сканирования
+— Ввод VK ID: цифры, id123, короткое имя
 """
 
 import os
@@ -80,7 +80,7 @@ async def resolve_user_id(identifier: str) -> int | None:
             return None
 
 # ====== VK: проверка членства ======
-async def check_vk_member(vk_id: int):
+async def vk_is_member(vk_id: int) -> bool | None:
     url = "https://api.vk.com/method/groups.isMember"
     params = {
         "group_id": VK_GROUP_ID,
@@ -96,64 +96,90 @@ async def check_vk_member(vk_id: int):
             logger.error(f"VK API groups.isMember error: {data}")
             return None
 
-# ====== VK: дни подписки через пагинацию ======
-async def vk_get_member_since_days_paged(vk_id: int, page_size: int = 1000) -> int | None:
-    """
-    Пошагово обходит участников через groups.getMembers (fields=member_since),
-    пока не найдёт пользователя vk_id или не упрётся в лимит VK_MAX_SCAN.
-    Возвращает дни подписки или None, если не нашли/нет доступа/скрыто.
-    """
-    max_scan = int(os.getenv("VK_MAX_SCAN", "200000"))
-    page_size = max(1, min(page_size, 1000))
-    scanned = 0
-    offset = 0
+# ====== VK: получить общее количество участников ======
+async def vk_members_count(session: aiohttp.ClientSession) -> int | None:
+    params = {
+        "group_id": VK_GROUP_ID,
+        "offset": 0,
+        "count": 1,
+        "sort": "id_asc",
+        "v": "5.199",
+        "access_token": VK_TOKEN,
+    }
+    for attempt in range(5):
+        async with session.get("https://api.vk.com/method/groups.getMembers", params=params) as resp:
+            data = await resp.json()
+        if "error" in data:
+            code = data["error"].get("error_code")
+            if code == 6:
+                await asyncio.sleep(0.35 + 0.15 * attempt)
+                continue
+            logger.error(f"VK API groups.getMembers (count) error: {data}")
+            return None
+        break
+    return int(data.get("response", {}).get("count", 0))
 
+# ====== VK: бинарный поиск по id_asc для получения member_since конкретного пользователя ======
+async def vk_get_member_since_days_binary(vk_id: int) -> int | None:
+    """
+    Быстро находим нужного участника по его ID в отсортированном списке (sort=id_asc),
+    не сканируя всю группу. Требует прав админа/модератора, чтобы поле member_since
+    возвращалось (если не скрыто приватностью).
+    """
     async with aiohttp.ClientSession() as session:
-        while scanned < max_scan:
+        total = await vk_members_count(session)
+        if not total:
+            return None
+
+        lo, hi = 0, total - 1
+
+        while lo <= hi:
+            mid = (lo + hi) // 2
             params = {
                 "group_id": VK_GROUP_ID,
-                "offset": offset,
-                "count": page_size,
+                "offset": mid,
+                "count": 1,
+                "sort": "id_asc",          # критично для бинарного поиска
                 "fields": "member_since",
                 "v": "5.199",
                 "access_token": VK_TOKEN,
             }
-            # простые ретраи на rate limit
+
+            # rate-limit-aware
             for attempt in range(5):
                 async with session.get("https://api.vk.com/method/groups.getMembers", params=params) as resp:
                     data = await resp.json()
                 if "error" in data:
                     code = data["error"].get("error_code")
-                    if code == 6:  # Too many requests per second
+                    if code == 6:
                         await asyncio.sleep(0.35 + 0.15 * attempt)
                         continue
-                    logger.error(f"VK API groups.getMembers error: {data}")
+                    logger.error(f"VK API groups.getMembers (bin) error: {data}")
                     return None
                 break
 
-            response = data.get("response") or {}
-            items = response.get("items") or []
+            resp = data.get("response") or {}
+            items = resp.get("items") or []
             if not items:
-                return None  # конец списка
+                # странно, но на всякий
+                return None
 
-            for u in items:
-                try:
-                    if int(u.get("id", 0)) == int(vk_id):
-                        ms = u.get("member_since")
-                        if ms:
-                            try:
-                                dt = datetime.fromtimestamp(int(ms), tz=timezone.utc)
-                                return max(0, (datetime.now(tz=timezone.utc) - dt).days)
-                            except Exception:
-                                return None
-                        return None  # нет поля -> скрыто/недоступно
-                except Exception:
-                    continue
+            uid = int(items[0].get("id", 0))
+            if uid == vk_id:
+                ms = items[0].get("member_since")
+                if ms:
+                    try:
+                        dt = datetime.fromtimestamp(int(ms), tz=timezone.utc)
+                        return max(0, (datetime.now(tz=timezone.utc) - dt).days)
+                    except Exception:
+                        return None
+                return None  # член найден, но поля нет (приватность или недоступно)
+            elif uid < vk_id:
+                lo = mid + 1
+            else:
+                hi = mid - 1
 
-            got = len(items)
-            scanned += got
-            offset += got
-            await asyncio.sleep(0.2)
+            await asyncio.sleep(0.05)  # щадим лимиты
 
     return None
 
@@ -178,7 +204,7 @@ async def your_card(message: types.Message):
         return
     vk_id = user_data[user_id]["vk_id"]
 
-    is_member = await check_vk_member(vk_id)
+    is_member = await vk_is_member(vk_id)
     if is_member is None:
         await message.answer("Не удалось проверить подписку. Проверьте токен VK и права доступа.")
         return
@@ -186,7 +212,8 @@ async def your_card(message: types.Message):
         await message.answer("Вы ещё не с нами ❌")
         return
 
-    days = await vk_get_member_since_days_paged(vk_id)
+    # быстро пытаемся достать member_since через бинарный поиск
+    days = await vk_get_member_since_days_binary(vk_id)
     if isinstance(days, int):
         await message.answer(f"Вы с нами! ✅\nПодписаны уже {days} дн.")
     else:
@@ -194,7 +221,6 @@ async def your_card(message: types.Message):
 
 @dp.message(F.text == "Настройки")
 async def settings_start(message: types.Message):
-    # ставим флаг ожидания VK ID
     info = user_data.get(message.from_user.id, {})
     info["awaiting_vk"] = True
     user_data[message.from_user.id] = info
@@ -202,7 +228,6 @@ async def settings_start(message: types.Message):
 
 @dp.message()
 async def process_any_message(message: types.Message):
-    # если ждём VK ID — пытаемся распознать
     info = user_data.get(message.from_user.id, {})
     if info.get("awaiting_vk"):
         raw = (message.text or "").strip()
@@ -216,7 +241,6 @@ async def process_any_message(message: types.Message):
         await message.answer("VK ID сохранён!", reply_markup=main_menu())
         return
 
-    # прочие сообщения — подсказываем меню
     await message.answer("Выберите действие из меню ниже.", reply_markup=main_menu())
 
 # ====== VK Callback HTTP server ======
